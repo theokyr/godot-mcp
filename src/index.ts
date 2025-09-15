@@ -667,6 +667,33 @@ class GodotServer {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
+          name: 'send_console_command',
+          description: 'Send a console command to a running Godot project (WorldGame) via MCP inbox',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              command: {
+                type: 'string',
+                description: 'Console command to execute (e.g., "map res://scenes/dev/dev_city.tscn")',
+              },
+              fallbackRun: {
+                type: 'boolean',
+                description: 'If no active process, run project and pass +command via CLI',
+                default: true,
+              },
+              scene: {
+                type: 'string',
+                description: 'Optional scene to run if falling back to run_project',
+              },
+            },
+            required: ['projectPath', 'command'],
+          },
+        },
+        {
           name: 'launch_editor',
           description: 'Launch Godot editor for a specific project',
           inputSchema: {
@@ -935,6 +962,8 @@ class GodotServer {
           return await this.handleLaunchEditor(request.params.arguments);
         case 'run_project':
           return await this.handleRunProject(request.params.arguments);
+        case 'send_console_command':
+          return await this.handleSendConsoleCommand(request.params.arguments);
         case 'get_debug_output':
           return await this.handleGetDebugOutput();
         case 'stop_project':
@@ -1149,6 +1178,180 @@ class GodotServer {
           'Verify the project path is accessible',
         ]
       );
+    }
+  }
+
+  /**
+   * Handle the send_console_command tool
+   */
+  private async handleSendConsoleCommand(args: any) {
+    // Normalize parameters to camelCase
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.command) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath and command']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const userDir = this.getGodotUserDataDir(args.projectPath);
+      const inboxDir = join(userDir, 'mcp', 'inbox');
+
+      // Ensure inbox directory exists
+      if (!existsSync(inboxDir)) {
+        mkdirSync(inboxDir, { recursive: true });
+      }
+
+      // Write command to a unique file
+      const safeTimestamp = Date.now();
+      const fileName = `cmd_${safeTimestamp}.txt`;
+      const filePath = join(inboxDir, fileName);
+
+      const fs = await import('fs');
+      await fs.promises.writeFile(filePath, args.command, { encoding: 'utf8' });
+
+      // If a process is active, just drop the file and return
+      if (this.activeProcess) {
+        return {
+          content: [
+            { type: 'text', text: `Command queued to MCP inbox: ${args.command}` },
+          ],
+        };
+      }
+
+      // No active process; optionally start the project and pass +command
+      const fallbackRun = args.fallbackRun !== false; // default true
+      if (!fallbackRun) {
+        return {
+          content: [
+            { type: 'text', text: `No active process. Command written to inbox only.` },
+          ],
+        };
+      }
+
+      // Start project with +<command> so it executes early via ConsoleSystem CLI parser
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            [
+              'Ensure Godot is installed correctly',
+              'Set GODOT_PATH environment variable to specify the correct path',
+            ]
+          );
+        }
+      }
+
+      // No active process expected here since we only fallback when inactive.
+
+      const plusArg = `+${args.command}`;
+      const cmdArgs = ['-d', '--path', args.projectPath, plusArg];
+      if (args.scene && this.validatePath(args.scene)) {
+        cmdArgs.push(args.scene);
+      }
+
+      const process = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+      const output: string[] = [];
+      const errors: string[] = [];
+
+      process.stdout?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n');
+        output.push(...lines);
+        lines.forEach((line: string) => {
+          if (line.trim()) this.logDebug(`[Godot stdout] ${line}`);
+        });
+      });
+
+      process.stderr?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n');
+        errors.push(...lines);
+        lines.forEach((line: string) => {
+          if (line.trim()) this.logDebug(`[Godot stderr] ${line}`);
+        });
+      });
+
+      process.on('exit', (code: number | null) => {
+        this.logDebug(`Godot process (fallback run) exited with code ${code}`);
+        if (this.activeProcess && this.activeProcess.process === process) {
+          this.activeProcess = null;
+        }
+      });
+
+      process.on('error', (err: Error) => {
+        console.error('Failed to start Godot process (fallback run):', err);
+        if (this.activeProcess && this.activeProcess.process === process) {
+          this.activeProcess = null;
+        }
+      });
+
+      this.activeProcess = { process, output, errors };
+
+      return {
+        content: [
+          { type: 'text', text: `Command queued and project started with CLI: ${args.command}` },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to send console command: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure the project user data directory is accessible',
+          'Verify the Godot path is valid',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Determine Godot's user data directory for a project.
+   * For WorldGame, default path is %APPDATA%/Godot/app_userdata/WorldGame.
+   * If not determinable, fall back to that default which matches project config.
+   */
+  private getGodotUserDataDir(projectPath: string): string {
+    const osPlatform = process.platform;
+    // Try to read project name from project.godot to build app_userdata path
+    try {
+      const projectFile = join(projectPath, 'project.godot');
+      if (existsSync(projectFile)) {
+        const fs = require('fs');
+        const content = fs.readFileSync(projectFile, 'utf8');
+        const match = content.match(/config\/name="([^"]+)"/);
+        const name = match?.[1] || 'WorldGame';
+        if (osPlatform === 'win32') {
+          const appData = process.env.APPDATA || join(process.env.USERPROFILE || 'C:', 'AppData', 'Roaming');
+          return join(appData, 'Godot', 'app_userdata', name);
+        } else if (osPlatform === 'darwin') {
+          const home = process.env.HOME || '~';
+          return join(home, 'Library', 'Application Support', 'Godot', 'app_userdata', name);
+        } else {
+          const home = process.env.HOME || '~';
+          return join(home, '.local', 'share', 'godot', 'app_userdata', name);
+        }
+      }
+    } catch {
+      // ignore and fall back
+    }
+
+    // Fallback to known WorldGame path
+    if (osPlatform === 'win32') {
+      const appData = process.env.APPDATA || join(process.env.USERPROFILE || 'C:', 'AppData', 'Roaming');
+      return join(appData, 'Godot', 'app_userdata', 'WorldGame');
+    } else if (osPlatform === 'darwin') {
+      const home = process.env.HOME || '~';
+      return join(home, 'Library', 'Application Support', 'Godot', 'app_userdata', 'WorldGame');
+    } else {
+      const home = process.env.HOME || '~';
+      return join(home, '.local', 'share', 'godot', 'app_userdata', 'WorldGame');
     }
   }
 
