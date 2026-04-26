@@ -10,9 +10,8 @@
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
 import { existsSync, readdirSync, mkdirSync } from 'fs';
-import { spawn } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
-import { exec } from 'child_process';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -27,7 +26,7 @@ import {
 const DEBUG_MODE: boolean = process.env.DEBUG === 'true';
 const GODOT_DEBUG_MODE: boolean = true; // Always use GODOT DEBUG MODE
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // Derive __filename and __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -134,7 +133,7 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
-    if (debugMode) console.debug(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
+    if (debugMode) console.error(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
 
     // Initialize the MCP server
     this.server = new Server(
@@ -164,10 +163,11 @@ class GodotServer {
 
   /**
    * Log debug messages if debug mode is enabled
+   * Using stderr instead of stdout to avoid interfering with JSON-RPC communication
    */
   private logDebug(message: string): void {
     if (DEBUG_MODE) {
-      console.debug(`[DEBUG] ${message}`);
+      console.error(`[DEBUG] ${message}`);
     }
   }
 
@@ -215,6 +215,16 @@ class GodotServer {
   }
 
   /**
+   * Validate a Godot class name to prevent arbitrary script instantiation.
+   * Class names must be simple identifiers (e.g. "Node2D", "CharacterBody3D").
+   * Rejects anything that looks like a path (res://, absolute paths, dots, slashes, colons).
+   */
+  private validateClassName(name: string): boolean {
+    if (!name) return false;
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+  }
+
+  /**
    * Synchronous validation for constructor use
    * This is a quick check that only verifies file existence, not executable validity
    * Full validation will be performed later in detectGodotPath
@@ -251,8 +261,8 @@ class GodotServer {
       }
 
       // Try to execute Godot with --version flag
-      const command = path === 'godot' ? 'godot --version' : `"${path}" --version`;
-      await execAsync(command);
+      // Using execFileAsync with argument array to prevent command injection
+      await execFileAsync(path, ['--version']);
 
       this.logDebug(`Valid Godot path: ${path}`);
       this.validatedPaths.set(path, true);
@@ -333,8 +343,8 @@ class GodotServer {
 
     // If we get here, we couldn't find Godot
     this.logDebug(`Warning: Could not find Godot in common locations for ${osPlatform}`);
-    console.warn(`[SERVER] Could not find Godot in common locations for ${osPlatform}`);
-    console.warn(`[SERVER] Set GODOT_PATH=/path/to/godot environment variable or pass { godotPath: '/path/to/godot' } in the config to specify the correct path.`);
+    console.error(`[SERVER] Could not find Godot in common locations for ${osPlatform}`);
+    console.error(`[SERVER] Set GODOT_PATH=/path/to/godot environment variable or pass { godotPath: '/path/to/godot' } in the config to specify the correct path.`);
 
     if (this.strictPathValidation) {
       // In strict mode, throw an error
@@ -350,8 +360,8 @@ class GodotServer {
       }
 
       this.logDebug(`Using default path: ${this.godotPath}, but this may not work.`);
-      console.warn(`[SERVER] Using default path: ${this.godotPath}, but this may not work.`);
-      console.warn(`[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.`);
+      console.error(`[SERVER] Using default path: ${this.godotPath}, but this may not work.`);
+      console.error(`[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.`);
     }
   }
 
@@ -495,45 +505,36 @@ class GodotServer {
     try {
       // Serialize the snake_case parameters to a valid JSON string
       const paramsJson = JSON.stringify(snakeCaseParams);
-      // Escape single quotes in the JSON string to prevent command injection
-      const escapedParams = paramsJson.replace(/'/g, "'\\''");
-      // On Windows, cmd.exe does not strip single quotes, so we use
-      // double quotes and escape them to ensure the JSON is parsed
-      // correctly by Godot.
-      const isWindows = process.platform === 'win32';
-      const quotedParams = isWindows
-        ? `\"${paramsJson.replace(/\"/g, '\\"')}\"`
-        : `'${escapedParams}'`;
 
-
-      // Add debug arguments if debug mode is enabled
-      const debugArgs = GODOT_DEBUG_MODE ? ['--debug-godot'] : [];
-
-      // Construct the command with the operation and JSON parameters
-      const cmd = [
-        `"${this.godotPath}"`,
+      // Build argument array for execFile to prevent command injection
+      // Using execFile with argument arrays avoids shell interpretation entirely
+      const args = [
         '--headless',
         '--path',
-        `"${projectPath}"`,
+        projectPath,  // Safe: passed as argument, not interpolated into shell command
         '--script',
-        `"${this.operationsScriptPath}"`,
+        this.operationsScriptPath,
         operation,
-        quotedParams, // Pass the JSON string as a single argument
-        ...debugArgs,
-      ].join(' ');
+        paramsJson,  // Safe: passed as argument, not interpreted by shell
+      ];
 
-      this.logDebug(`Command: ${cmd}`);
+      
+      if (GODOT_DEBUG_MODE) {
+        args.push('--debug-godot');
+      }
 
-      const { stdout, stderr } = await execAsync(cmd);
+      this.logDebug(`Executing: ${this.godotPath} ${args.join(' ')}`);
 
-      return { stdout, stderr };
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, args);
+
+      return { stdout: stdout ?? '', stderr: stderr ?? '' };
     } catch (error: unknown) {
-      // If execAsync throws, it still contains stdout/stderr
+      // If execFileAsync throws, it still contains stdout/stderr
       if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
         const execError = error as Error & { stdout: string; stderr: string };
         return {
-          stdout: execError.stdout,
-          stderr: execError.stderr,
+          stdout: execError.stdout ?? '',
+          stderr: execError.stderr ?? '',
         };
       }
 
@@ -801,7 +802,6 @@ class GodotServer {
               rootNodeType: {
                 type: 'string',
                 description: 'Type of the root node (e.g., Node2D, Node3D)',
-                default: 'Node2D',
               },
             },
             required: ['projectPath', 'scenePath'],
@@ -824,7 +824,6 @@ class GodotServer {
               parentNodePath: {
                 type: 'string',
                 description: 'Path to the parent node (e.g., "root" or "root/Player")',
-                default: 'root',
               },
               nodeType: {
                 type: 'string',
@@ -1444,7 +1443,7 @@ class GodotServer {
       }
 
       this.logDebug('Getting Godot version');
-      const { stdout } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout } = await execFileAsync(this.godotPath!, ['--version']);
       return {
         content: [
           {
@@ -1631,7 +1630,7 @@ class GodotServer {
   
       // Get Godot version
       const execOptions = { timeout: 10000 }; // 10 second timeout
-      const { stdout } = await execAsync(`"${this.godotPath}" --version`, execOptions);
+      const { stdout } = await execFileAsync(this.godotPath!, ['--version'], execOptions);
   
       // Get project structure using the recursive method
       const projectStructure = await this.getProjectStructureAsync(args.projectPath);
@@ -1701,6 +1700,14 @@ class GodotServer {
       );
     }
 
+    const rootNodeType = args.rootNodeType || 'Node2D';
+    if (!this.validateClassName(rootNodeType)) {
+      return this.createErrorResponse(
+        'Invalid rootNodeType',
+        ['rootNodeType must be a built-in Godot class name (no paths, no file extensions)']
+      );
+    }
+
     try {
       // Check if the project directory exists and contains a project.godot file
       const projectFile = join(args.projectPath, 'project.godot');
@@ -1717,7 +1724,7 @@ class GodotServer {
       // Prepare parameters for the operation (already in camelCase)
       const params = {
         scenePath: args.scenePath,
-        rootNodeType: args.rootNodeType || 'Node2D',
+        rootNodeType,
       };
 
       // Execute the operation
@@ -1772,6 +1779,13 @@ class GodotServer {
       return this.createErrorResponse(
         'Invalid path',
         ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    if (!this.validateClassName(args.nodeType)) {
+      return this.createErrorResponse(
+        'Invalid nodeType',
+        ['nodeType must be a built-in Godot class name (no paths, no file extensions)']
       );
     }
 
@@ -2206,7 +2220,7 @@ class GodotServer {
       }
 
       // Get Godot version to check if UIDs are supported
-      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout: versionOutput } = await execFileAsync(this.godotPath!, ['--version']);
       const version = versionOutput.trim();
 
       if (!this.isGodot44OrLater(version)) {
@@ -2306,7 +2320,7 @@ class GodotServer {
       }
 
       // Get Godot version to check if UIDs are supported
-      const { stdout: versionOutput } = await execAsync(`"${this.godotPath}" --version`);
+      const { stdout: versionOutput } = await execFileAsync(this.godotPath!, ['--version']);
       const version = versionOutput.trim();
 
       if (!this.isGodot44OrLater(version)) {
@@ -2382,13 +2396,13 @@ class GodotServer {
           process.exit(1);
         } else {
           // In compatibility mode, warn but continue with the default path
-          console.warn(`[SERVER] Warning: Using potentially invalid Godot path: ${this.godotPath}`);
-          console.warn('[SERVER] This may cause issues when executing Godot commands');
-          console.warn('[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.');
+          console.error(`[SERVER] Warning: Using potentially invalid Godot path: ${this.godotPath}`);
+          console.error('[SERVER] This may cause issues when executing Godot commands');
+          console.error('[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.');
         }
       }
 
-      console.log(`[SERVER] Using Godot at: ${this.godotPath}`);
+      console.error(`[SERVER] Using Godot at: ${this.godotPath}`);
 
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
